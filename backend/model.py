@@ -285,3 +285,80 @@ def get_all_vehicle_curves() -> list:
             "T_final":      round(row["T_final"], 3),
         })
     return result
+
+
+# ---------------------------------------------------------------------------
+# Physical sanity checks  (run once at startup)
+# ---------------------------------------------------------------------------
+
+def _validate_physics() -> None:
+    """Test 4 fundamental physical relationships and print PASS/FAIL."""
+    BASE = {
+        "heat_load_kw":          4.8,
+        "cabin_volume_m3":       3.1,
+        "pulley_ratio":          1.5,
+        "solar_w_m2":            1200.0,
+        "ac_unit_capacity_kw":   4.4,
+        "condenser_capacity_kw": 9.0,
+        "compressor_size_cc":    130.0,
+        "airflow_m3_hr":         550.0,
+        "soaking_time_hr":       1.0,
+        "rpm_0_30":              1600.0,
+        "rpm_31_50":             1700.0,
+        "rpm_51_70":             1800.0,
+        "rpm_71_90":             750.0,
+        "ebhs":                  100.0,
+    }
+
+    def _vary(**kwargs):
+        s = dict(BASE)
+        s.update(kwargs)
+        return s
+
+    def _run(specs):
+        _, tau1, _, T_final = predict_curve(specs, method="physics_ridge")
+        return tau1, T_final
+
+    # (label, metric_lo, metric_hi, should_increase, unit)
+    checks = [
+        (
+            "Higher EBHS increases T_final",
+            _run(_vary(ebhs=70))[1],
+            _run(_vary(ebhs=190))[1],
+            True,
+            "degC",
+        ),
+        (
+            "Higher airflow reduces tau1",
+            _run(_vary(airflow_m3_hr=449))[0],
+            _run(_vary(airflow_m3_hr=641))[0],
+            False,
+            " min",
+        ),
+        (
+            "Higher heat_load increases T_final",
+            _run(_vary(heat_load_kw=3.6))[1],
+            _run(_vary(heat_load_kw=5.5))[1],
+            True,
+            "degC",
+        ),
+        (
+            "Higher ac_unit_capacity reduces T_final",
+            _run(_vary(ac_unit_capacity_kw=4.4))[1],
+            _run(_vary(ac_unit_capacity_kw=5.4))[1],
+            False,
+            "degC",
+        ),
+    ]
+
+    print("\nVALIDATION RESULTS:")
+    n_pass = 0
+    for label, v_lo, v_hi, should_increase, unit in checks:
+        passed = (v_hi > v_lo) if should_increase else (v_hi < v_lo)
+        n_pass += passed
+        tag = "PASS" if passed else "FAIL"
+        print(f"  [{tag}] {label}: {v_lo:.1f} -> {v_hi:.1f}{unit}")
+    print(f"  {n_pass}/{len(checks)} checks passed\n")
+
+
+_validate_physics()
