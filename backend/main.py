@@ -1,0 +1,35 @@
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+from backend.model import get_all_vehicle_curves, predict_curve
+from backend.schemas import PredictionResponse, VehicleSpecs
+
+app = FastAPI(title="Vehicle Cabin Temperature Predictor", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/predict", response_model=PredictionResponse)
+def predict(
+    specs: VehicleSpecs,
+    method: str = Query("physics_ridge", enum=["physics_ridge", "knn"]),
+):
+    temps, tau, T_final = predict_curve(specs.model_dump(), method=method)
+    return PredictionResponse(
+        time_points=list(range(0, 95, 5)),
+        temperatures=[round(t, 2) for t in temps],
+        tau=round(tau, 3),
+        T_final=round(T_final, 3),
+        method=method,
+    )
+
+
+@app.get("/vehicles")
+def get_vehicles():
+    return get_all_vehicle_curves()
