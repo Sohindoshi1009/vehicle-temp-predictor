@@ -18,13 +18,14 @@ app.add_middleware(
 @app.post("/predict", response_model=PredictionResponse)
 def predict(
     specs: VehicleSpecs,
-    method: str = Query("physics_ridge", enum=["physics_ridge", "knn"]),
+    method: str = Query("physics_ridge", enum=["physics_ridge", "knn", "random_forest"]),
 ):
-    temps, tau, T_final = predict_curve(specs.model_dump(), method=method)
+    temps, tau1, tau2, T_final = predict_curve(specs.model_dump(), method=method)
     return PredictionResponse(
         time_points=list(range(0, 95, 5)),
         temperatures=[round(t, 2) for t in temps],
-        tau=round(tau, 3),
+        tau1=round(tau1, 3),
+        tau2=round(tau2, 3),
         T_final=round(T_final, 3),
         method=method,
     )

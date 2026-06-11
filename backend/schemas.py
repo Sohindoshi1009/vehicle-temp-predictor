@@ -23,6 +23,7 @@ class VehicleSpecs(BaseModel):
 class PredictionResponse(BaseModel):
     time_points: List[int]
     temperatures: List[float]
-    tau: float
+    tau1: float
+    tau2: float
     T_final: float
     method: str

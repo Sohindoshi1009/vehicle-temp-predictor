@@ -27,6 +27,13 @@ FEATURE_CONFIG = {
 COLORS = {
     "physics_ridge": "#E63946",
     "knn":           "#2196F3",
+    "random_forest": "#4CAF50",
+}
+
+METHOD_LABELS = {
+    "physics_ridge": "Physics + Ridge",
+    "knn":           "KNN",
+    "random_forest": "Random Forest",
 }
 
 
@@ -81,9 +88,10 @@ def main():
     show_training = st.sidebar.checkbox("Overlay training vehicle curves", value=False)
 
     # ── Predict buttons ───────────────────────────────────────────────────────
-    col_r, col_k, col_clr = st.columns([2, 2, 1])
+    col_r, col_k, col_rf, col_clr = st.columns([2, 2, 2, 1])
     clicked_ridge = col_r.button("Predict (Physics + Ridge)", use_container_width=True)
     clicked_knn   = col_k.button("Predict (KNN)",             use_container_width=True)
+    clicked_rf    = col_rf.button("Predict (Random Forest)",  use_container_width=True)
     clicked_clear = col_clr.button("Clear", use_container_width=True)
 
     if "predictions" not in st.session_state:
@@ -92,7 +100,11 @@ def main():
     if clicked_clear:
         st.session_state.predictions = {}
 
-    for btn, method in [(clicked_ridge, "physics_ridge"), (clicked_knn, "knn")]:
+    for btn, method in [
+        (clicked_ridge, "physics_ridge"),
+        (clicked_knn,   "knn"),
+        (clicked_rf,    "random_forest"),
+    ]:
         if btn:
             data, err = call_predict(specs, method)
             if err:
@@ -117,7 +129,7 @@ def main():
             ))
 
     for method, data in st.session_state.predictions.items():
-        label = "Physics + Ridge" if method == "physics_ridge" else "KNN"
+        label = METHOD_LABELS[method]
         fig.add_trace(go.Scatter(
             x=data["time_points"],
             y=data["temperatures"],
@@ -142,13 +154,21 @@ def main():
     # ── Metrics ───────────────────────────────────────────────────────────────
     if st.session_state.predictions:
         st.subheader("Predicted Parameters")
-        cols = st.columns(len(st.session_state.predictions) * 2)
+        cols = st.columns(len(st.session_state.predictions) * 3)
         idx = 0
         for method, data in st.session_state.predictions.items():
-            label = "Physics + Ridge" if method == "physics_ridge" else "KNN"
-            cols[idx].metric(f"τ — {label} (min)", f"{data['tau']:.2f}")
-            cols[idx + 1].metric(f"T_final — {label} (°C)", f"{data['T_final']:.2f}")
-            idx += 2
+            label = METHOD_LABELS[method]
+            is_rf = method == "random_forest"
+            cols[idx].metric(
+                f"τ₁ — {label} (min)",
+                "N/A" if is_rf else f"{data['tau1']:.2f}",
+            )
+            cols[idx + 1].metric(
+                f"τ₂ — {label} (min)",
+                "N/A" if is_rf else f"{data['tau2']:.2f}",
+            )
+            cols[idx + 2].metric(f"T_final — {label} (°C)", f"{data['T_final']:.2f}")
+            idx += 3
 
 
 if __name__ == "__main__":
