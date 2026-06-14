@@ -26,15 +26,16 @@ DATA_PATH = Path(__file__).parent / "data" / "vehicles_combined.csv"
 # Feature subsets for each dedicated Ridge model
 TAU1_FEATS    = ["ac_power_phase1", "airflow_m3_hr", "cabin_volume_m3", "tau_physics"]
 TAU2_FEATS    = ["rpm_drop", "ac_power_phase2", "compressor_size_cc"]
-T_FINAL_FEATS = ["net_cooling_power", "sealing_quality", "cooling_effectiveness", "ebhs_heat_fraction"]
+T_FINAL_FEATS = ["heat_balance_ratio"]
 
 # All engineered features (used by KNN and RF)
 ENG_FEATS_ALL = [
     "ac_power_phase1", "ac_power_phase2",
     "heat_density", "cooling_effectiveness", "rpm_drop",
     "airflow_heat_ratio", "solar_gain",
-    "net_cooling_power", "ebhs_heat_fraction", "sealing_quality",
-    "infiltration_airflow_ratio", "thermal_mass", "tau_physics",
+    "net_cooling_power", "ebhs_heat_fraction", "heat_load_fraction",
+    "ac_per_volume", "net_cooling_per_volume", "heat_balance_ratio",
+    "sealing_quality", "infiltration_airflow_ratio", "thermal_mass", "tau_physics",
 ]
 RF_FEATS = ENG_FEATS_ALL + ["time_min"]
 
@@ -55,7 +56,12 @@ def _engineer_df(df: pd.DataFrame) -> pd.DataFrame:
     # Physics-correct EBHS features
     df["net_cooling_power"]          = (df["ac_unit_capacity_kw"] - df["heat_load_kw"]
                                         - df["ebhs"] * 0.003 - df["solar_w_m2"] * 0.001)
-    df["ebhs_heat_fraction"]         = (df["ebhs"] * 0.003) / df["heat_load_kw"]
+    df["ebhs_heat_fraction"]         = df["ebhs"] * 0.003
+    df["heat_load_fraction"]         = df["heat_load_kw"] / df["ac_unit_capacity_kw"]
+    df["ac_per_volume"]              = df["ac_unit_capacity_kw"] / df["cabin_volume_m3"]
+    df["net_cooling_per_volume"]     = df["net_cooling_power"] / df["cabin_volume_m3"]
+    # Composite heat balance: (total heat in) / (AC capacity) — monotonically correct for Ridge
+    df["heat_balance_ratio"]         = (df["heat_load_kw"] + df["ebhs"] * 0.003 + df["solar_w_m2"] * 0.001) / df["ac_unit_capacity_kw"]
     df["sealing_quality"]            = 1.0 / (1.0 + df["ebhs"] / 100.0)
     df["infiltration_airflow_ratio"] = df["ebhs"] / df["airflow_m3_hr"]
     df["thermal_mass"]               = df["cabin_volume_m3"] * 1.2 * 1.006
@@ -75,7 +81,12 @@ def _engineer_single(specs: dict) -> dict:
     # Physics-correct EBHS features
     d["net_cooling_power"]          = (d["ac_unit_capacity_kw"] - d["heat_load_kw"]
                                        - d["ebhs"] * 0.003 - d["solar_w_m2"] * 0.001)
-    d["ebhs_heat_fraction"]         = (d["ebhs"] * 0.003) / d["heat_load_kw"]
+    d["ebhs_heat_fraction"]         = d["ebhs"] * 0.003
+    d["heat_load_fraction"]         = d["heat_load_kw"] / d["ac_unit_capacity_kw"]
+    d["ac_per_volume"]              = d["ac_unit_capacity_kw"] / d["cabin_volume_m3"]
+    d["net_cooling_per_volume"]     = d["net_cooling_power"] / d["cabin_volume_m3"]
+    # Composite heat balance: (total heat in) / (AC capacity) — monotonically correct for Ridge
+    d["heat_balance_ratio"]         = (d["heat_load_kw"] + d["ebhs"] * 0.003 + d["solar_w_m2"] * 0.001) / d["ac_unit_capacity_kw"]
     d["sealing_quality"]            = 1.0 / (1.0 + d["ebhs"] / 100.0)
     d["infiltration_airflow_ratio"] = d["ebhs"] / d["airflow_m3_hr"]
     d["thermal_mass"]               = d["cabin_volume_m3"] * 1.2 * 1.006
@@ -176,9 +187,8 @@ def _build_long_format(df: pd.DataFrame) -> tuple:
 
 
 def _build_models(df: pd.DataFrame):
-    ridge_tau1,    sc_tau1    = _make_ridge(df, TAU1_FEATS,    "tau1")
-    ridge_tau2,    sc_tau2    = _make_ridge(df, TAU2_FEATS,    "tau2")
-    ridge_T_final, sc_T_final = _make_ridge(df, T_FINAL_FEATS, "T_final")
+    ridge_tau1, sc_tau1 = _make_ridge(df, TAU1_FEATS, "tau1")
+    ridge_tau2, sc_tau2 = _make_ridge(df, TAU2_FEATS, "tau2")
 
     # KNN: all engineered features → [tau1, tau2, T_final]
     sc_knn = StandardScaler()
@@ -192,24 +202,30 @@ def _build_models(df: pd.DataFrame):
     rf = RandomForestRegressor(n_estimators=100, max_depth=4, random_state=42)
     rf.fit(X_rf, y_rf)
 
+    # Physics-scaling calibration for T_final (proportional to heat_balance_ratio)
+    mean_T_final       = float(df["T_final"].mean())
+    mean_heat_balance  = float(df["heat_balance_ratio"].mean())
+
     return (
         ridge_tau1, sc_tau1,
         ridge_tau2, sc_tau2,
-        ridge_T_final, sc_T_final,
         knn, sc_knn,
         rf,
         float(df["T_soak"].mean()),
+        mean_T_final,
+        mean_heat_balance,
     )
 
 
 _df = _load_and_fit()
 (
-    _ridge_tau1,    _sc_tau1,
-    _ridge_tau2,    _sc_tau2,
-    _ridge_T_final, _sc_T_final,
-    _knn,           _sc_knn,
+    _ridge_tau1,       _sc_tau1,
+    _ridge_tau2,       _sc_tau2,
+    _knn,              _sc_knn,
     _rf,
     _mean_T_soak,
+    _mean_T_final,
+    _mean_heat_balance,
 ) = _build_models(_df)
 
 
@@ -245,9 +261,9 @@ def predict_curve(specs_dict: dict, method: str = "physics_ridge"):
             X = np.array([eng[f] for f in feats]).reshape(1, -1)
             return float(model.predict(sc.transform(X))[0])
 
-        tau1    = _pred(_ridge_tau1,    _sc_tau1,    TAU1_FEATS)
-        tau2    = _pred(_ridge_tau2,    _sc_tau2,    TAU2_FEATS)
-        T_final = _pred(_ridge_T_final, _sc_T_final, T_FINAL_FEATS)
+        tau1    = _pred(_ridge_tau1, _sc_tau1, TAU1_FEATS)
+        tau2    = _pred(_ridge_tau2, _sc_tau2, TAU2_FEATS)
+        T_final = _mean_T_final * (eng["heat_balance_ratio"] / _mean_heat_balance)
 
         tau1    = max(0.5, tau1)
         tau2    = max(0.5, tau2)
