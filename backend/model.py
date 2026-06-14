@@ -26,7 +26,11 @@ DATA_PATH = Path(__file__).parent / "data" / "vehicles_combined.csv"
 # Feature subsets for each dedicated Ridge model
 TAU1_FEATS    = ["ac_power_phase1", "airflow_m3_hr", "cabin_volume_m3", "tau_physics"]
 TAU2_FEATS    = ["rpm_drop", "ac_power_phase2", "compressor_size_cc"]
-T_FINAL_FEATS = ["heat_balance_ratio"]
+T_FINAL_FEATS = [
+    "net_cooling_power", "sealing_quality", "cooling_effectiveness",
+    "ebhs_heat_fraction", "heat_load_fraction", "ac_per_volume",
+    "net_cooling_per_volume",
+]
 
 # All engineered features (used by KNN and RF)
 ENG_FEATS_ALL = [
@@ -189,6 +193,7 @@ def _build_long_format(df: pd.DataFrame) -> tuple:
 def _build_models(df: pd.DataFrame):
     ridge_tau1, sc_tau1 = _make_ridge(df, TAU1_FEATS, "tau1")
     ridge_tau2, sc_tau2 = _make_ridge(df, TAU2_FEATS, "tau2")
+    ridge_T_final_disp, sc_T_final_disp = _make_ridge(df, T_FINAL_FEATS, "T_final")
 
     # KNN: all engineered features → [tau1, tau2, T_final]
     sc_knn = StandardScaler()
@@ -209,6 +214,7 @@ def _build_models(df: pd.DataFrame):
     return (
         ridge_tau1, sc_tau1,
         ridge_tau2, sc_tau2,
+        ridge_T_final_disp, sc_T_final_disp,
         knn, sc_knn,
         rf,
         float(df["T_soak"].mean()),
@@ -219,9 +225,10 @@ def _build_models(df: pd.DataFrame):
 
 _df = _load_and_fit()
 (
-    _ridge_tau1,       _sc_tau1,
-    _ridge_tau2,       _sc_tau2,
-    _knn,              _sc_knn,
+    _ridge_tau1,        _sc_tau1,
+    _ridge_tau2,        _sc_tau2,
+    _ridge_T_final_disp, _sc_T_final_disp,
+    _knn,               _sc_knn,
     _rf,
     _mean_T_soak,
     _mean_T_final,
@@ -286,6 +293,37 @@ def predict_curve(specs_dict: dict, method: str = "physics_ridge"):
     temps = _rf.predict(X_rf).tolist()
     T_final = float(min(temps))
     return temps, 0.0, 0.0, T_final
+
+
+def get_feature_importances() -> dict:
+    def _ridge_importance(model, feat_names: list) -> dict:
+        coefs = model.coef_
+        abs_coefs = np.abs(coefs)
+        norm = abs_coefs / abs_coefs.max() if abs_coefs.max() > 0 else abs_coefs
+        return {
+            f: {"importance": float(imp), "sign": int(np.sign(c))}
+            for f, imp, c in zip(feat_names, norm, coefs)
+        }
+
+    ridge_tau1   = _ridge_importance(_ridge_tau1,        TAU1_FEATS)
+    ridge_tfinal = _ridge_importance(_ridge_T_final_disp, T_FINAL_FEATS)
+
+    rf_imps = _rf.feature_importances_
+    rf_norm = rf_imps / rf_imps.max() if rf_imps.max() > 0 else rf_imps
+    rf_signs = [
+        int(np.sign(np.corrcoef(_df[f].values, _df["T_final"].values)[0, 1]))
+        for f in ENG_FEATS_ALL
+    ] + [-1]
+    random_forest = {
+        f: {"importance": float(imp), "sign": sign}
+        for f, imp, sign in zip(RF_FEATS, rf_norm, rf_signs)
+    }
+
+    return {
+        "ridge_tau1":    ridge_tau1,
+        "ridge_tfinal":  ridge_tfinal,
+        "random_forest": random_forest,
+    }
 
 
 def get_all_vehicle_curves() -> list:

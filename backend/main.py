@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.model import get_all_vehicle_curves, predict_curve
+from backend.model import get_all_vehicle_curves, get_feature_importances, predict_curve
 from backend.schemas import PredictionResponse, VehicleSpecs
 
 app = FastAPI(title="Vehicle Cabin Temperature Predictor", version="1.0.0")
@@ -34,3 +34,8 @@ def predict(
 @app.get("/vehicles")
 def get_vehicles():
     return get_all_vehicle_curves()
+
+
+@app.get("/feature-importance")
+def feature_importance():
+    return get_feature_importances()
