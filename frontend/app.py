@@ -18,10 +18,10 @@ FEATURE_CONFIG = {
     "compressor_size_cc":     ("Compressor Size (cc)",       100.,  200.,  140.,  5.),
     "airflow_m3_hr":          ("Airflow (m³/hr)",            400.,  700.,  550.,  10.),
     "soaking_time_hr":        ("Soaking Time (hr)",          0.5,   3.0,   1.0,   0.5),
-    "rpm_0_30":               ("RPM 0–30 km/h",              1000., 2500., 1600., 50.),
-    "rpm_31_50":              ("RPM 31–50 km/h",             1000., 2500., 1700., 50.),
-    "rpm_51_70":              ("RPM 51–70 km/h",             1000., 2500., 1800., 50.),
-    "rpm_71_90":              ("RPM 71–90 km/h",             500.,  1200., 750.,  50.),
+    "rpm_0_30":               ("Engine RPM (0–30 min)",       1000., 2500., 1600., 50.),
+    "rpm_31_50":              ("Engine RPM (31–50 min)",      1000., 2500., 1700., 50.),
+    "rpm_51_70":              ("Engine RPM (51–70 min)",      1000., 2500., 1800., 50.),
+    "rpm_71_90":              ("Engine RPM (71–90 min)",      500.,  1200., 750.,  50.),
     "ebhs":                   ("EBHS",                       60.,   200.,  100.,  5.),
 }
 
@@ -42,7 +42,7 @@ FEATURE_EXPLANATIONS = {
     "ac_power_phase2":            "Compressor power at highway speed (cc × pulley × RPM 71–90). Sustains cooling in phase 2.",
     "heat_density":               "Heat load per m³ of cabin. Compact, crowded cabins have higher heat density.",
     "cooling_effectiveness":      "Airflow per m³ of cabin. Higher values improve convective heat removal per unit volume.",
-    "rpm_drop":                   "RPM fall from 51–70 km/h to 71–90 km/h. Steep drop reduces compressor speed at highway cruise.",
+    "rpm_drop":                   "RPM fall from 51–70 min to 71–90 min. Steep drop reduces compressor speed in the later stage.",
     "airflow_heat_ratio":         "Convective capacity of airflow vs heat load. Higher = airflow can keep pace with heating.",
     "solar_gain":                 "Solar heat absorbed (W/m² × cabin volume). Larger, sunnier cabins absorb more radiant heat.",
     "net_cooling_power":          "AC capacity minus all heat loads (passengers + EBHS + solar). Positive = cooling wins.",
@@ -274,6 +274,12 @@ def main():
                 "Red = hurts cooling.  "
                 "T_final Ridge is a diagnostic model — actual prediction uses physics scaling."
             )
+            st.info(
+                "**RPM bands 31–50, 51–70, 71–90 show low importance** because cooling completes "
+                "in segment 1 (0–30 min) for all training vehicles (τ₁ ≈ 3–5 min). "
+                "More diverse training data (higher thermal mass, lower AC power) is needed to "
+                "capture late-phase RPM effects."
+            )
 
     # ── Tab 3: Sensitivity Analysis ────────────────────────────────────────────
     with tab3:
@@ -284,72 +290,130 @@ def main():
             feat_keys   = list(FEATURE_CONFIG.keys())
             feat_labels = {k: FEATURE_CONFIG[k][0] for k in feat_keys}
 
-            c_sel, c_run = st.columns([4, 1])
-            with c_sel:
-                selected_feat = st.selectbox(
-                    "Feature to vary",
-                    options=feat_keys,
-                    format_func=lambda k: feat_labels[k],
-                )
-            with c_run:
-                st.markdown("<br>", unsafe_allow_html=True)
-                run_btn = st.button("Run Analysis", use_container_width=True)
-
-            feat_vals_train = [
-                v["features"][selected_feat]
-                for v in vehicles
-                if selected_feat in v["features"]
-            ]
-            feat_min = float(min(feat_vals_train))
-            feat_max = float(max(feat_vals_train))
-            st.caption(
-                f"Training data range for **{feat_labels[selected_feat]}**: "
-                f"{feat_min:.2f} – {feat_max:.2f}  |  "
-                f"All other features held at current sidebar values."
+            sens_mode = st.radio(
+                "Analysis mode",
+                options=["Individual band", "All bands scaled"],
+                horizontal=True,
             )
+
+            selected_feat = None
+            feat_min = feat_max = None
+
+            if sens_mode == "Individual band":
+                c_sel, c_run = st.columns([4, 1])
+                with c_sel:
+                    selected_feat = st.selectbox(
+                        "Feature to vary",
+                        options=feat_keys,
+                        format_func=lambda k: feat_labels[k],
+                    )
+                with c_run:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    run_btn = st.button("Run Analysis", use_container_width=True)
+
+                feat_vals_train = [
+                    v["features"][selected_feat]
+                    for v in vehicles
+                    if selected_feat in v["features"]
+                ]
+                feat_min = float(min(feat_vals_train))
+                feat_max = float(max(feat_vals_train))
+                st.caption(
+                    f"Training data range for **{feat_labels[selected_feat]}**: "
+                    f"{feat_min:.2f} – {feat_max:.2f}  |  "
+                    f"All other features held at current sidebar values."
+                )
+            else:
+                c_cap, c_run = st.columns([4, 1])
+                with c_cap:
+                    st.caption(
+                        "Scales all 4 RPM bands (0–30, 31–50, 51–70, 71–90 min) by the same "
+                        "multiplier (0.7× to 1.3×). Shows how the whole curve shape changes "
+                        "with uniform RPM variation."
+                    )
+                with c_run:
+                    run_btn = st.button("Run Analysis", use_container_width=True)
 
             if "sensitivity" not in st.session_state:
                 st.session_state.sensitivity = {}
 
             if run_btn:
-                test_vals = np.linspace(feat_min, feat_max, 5)
-                results = []
-                with st.spinner("Running 5 predictions…"):
-                    for v in test_vals:
-                        test_specs = dict(specs)
-                        test_specs[selected_feat] = float(v)
-                        data, err = call_predict(test_specs, "physics_ridge")
-                        if data:
-                            results.append((float(v), data))
-                st.session_state.sensitivity = {
-                    "feature": selected_feat,
-                    "results": results,
-                }
+                if sens_mode == "Individual band":
+                    test_vals = np.linspace(feat_min, feat_max, 5)
+                    results = []
+                    with st.spinner("Running 5 predictions…"):
+                        for v in test_vals:
+                            test_specs = dict(specs)
+                            test_specs[selected_feat] = float(v)
+                            data, err = call_predict(test_specs, "physics_ridge")
+                            if data:
+                                results.append((float(v), data))
+                    st.session_state.sensitivity = {
+                        "mode": "individual",
+                        "feature": selected_feat,
+                        "results": results,
+                    }
+                else:
+                    multipliers = np.linspace(0.7, 1.3, 5)
+                    results = []
+                    with st.spinner("Running 5 predictions…"):
+                        for mult in multipliers:
+                            test_specs = dict(specs)
+                            test_specs["rpm_0_30"]  = float(specs["rpm_0_30"]  * mult)
+                            test_specs["rpm_31_50"] = float(specs["rpm_31_50"] * mult)
+                            test_specs["rpm_51_70"] = float(specs["rpm_51_70"] * mult)
+                            test_specs["rpm_71_90"] = float(specs["rpm_71_90"] * mult)
+                            data, err = call_predict(test_specs, "physics_ridge")
+                            if data:
+                                results.append((float(mult), data))
+                    st.session_state.sensitivity = {
+                        "mode": "all_bands",
+                        "feature": None,
+                        "results": results,
+                    }
 
             sens = st.session_state.sensitivity
-            if sens and sens.get("feature") == selected_feat and sens.get("results"):
-                results = sens["results"]
-                n       = len(results)
+            show_results = bool(
+                sens
+                and sens.get("results")
+                and (
+                    (sens.get("mode") == "individual" and sens.get("feature") == selected_feat)
+                    or (sens.get("mode") == "all_bands" and sens_mode == "All bands scaled")
+                )
+            )
+
+            if show_results:
+                results  = sens["results"]
+                n        = len(results)
                 gradient = pc.n_colors("rgb(0,0,210)", "rgb(210,0,0)", n, colortype="rgb")
-                label_full = feat_labels[selected_feat]
+
+                if sens["mode"] == "individual":
+                    label_full  = feat_labels[selected_feat]
+                    chart_title = f"Sensitivity: Varying {label_full}"
+                else:
+                    label_full  = "RPM Multiplier"
+                    chart_title = "Sensitivity: All RPM Bands Scaled Uniformly"
 
                 fig = go.Figure()
                 for i, (val, data) in enumerate(results):
+                    if sens["mode"] == "individual":
+                        trace_name  = f"{label_full} = {val:.2f}"
+                        hover_title = f"<b>{label_full} = {val:.2f}</b><br>"
+                    else:
+                        trace_name  = f"All RPMs x{val:.2f}"
+                        hover_title = f"<b>All RPMs x{val:.2f}</b><br>"
                     fig.add_trace(go.Scatter(
                         x=data["time_points"],
                         y=data["temperatures"],
                         mode="lines+markers",
-                        name=f"{label_full} = {val:.2f}",
+                        name=trace_name,
                         line=dict(color=gradient[i], width=2.5),
                         marker=dict(size=5),
-                        hovertemplate=(
-                            f"<b>{label_full} = {val:.2f}</b><br>"
-                            "t=%{x} min<br>T=%{y:.2f} °C<extra></extra>"
-                        ),
+                        hovertemplate=hover_title + "t=%{x} min<br>T=%{y:.2f} °C<extra></extra>",
                     ))
 
                 fig.update_layout(
-                    title=f"Sensitivity: Varying {label_full}",
+                    title=chart_title,
                     xaxis_title="Time (minutes)",
                     yaxis_title="Temperature (°C)",
                     height=460,
@@ -360,17 +424,26 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
 
                 st.subheader("Parameter Summary")
-                time_30_idx = 6   # TIME_POINTS[6] == 30 min
+                time_5_idx  = 1   # TIME_POINTS[1]  ==  5 min
+                time_15_idx = 3   # TIME_POINTS[3]  == 15 min
+                time_30_idx = 6   # TIME_POINTS[6]  == 30 min
                 time_60_idx = 12  # TIME_POINTS[12] == 60 min
                 table = {
-                    label_full:        [f"{v:.2f}"              for v, _    in results],
-                    "τ₁ (min)":        [f"{d['tau1']:.2f}"      for _, d    in results],
-                    "τ₂ (min)":        [f"{d['tau2']:.2f}"      for _, d    in results],
+                    label_full:        [f"{v:.2f}"             for v, _    in results],
+                    "τ₁ (min)":        [f"{d['tau1']:.2f}"     for _, d    in results],
+                    "τ₂ (min)":        [f"{d['tau2']:.2f}"     for _, d    in results],
+                    "T @ 5 min (°C)":  [f"{d['temperatures'][time_5_idx]:.2f}"  for _, d in results],
+                    "T @ 15 min (°C)": [f"{d['temperatures'][time_15_idx]:.2f}" for _, d in results],
                     "T @ 30 min (°C)": [f"{d['temperatures'][time_30_idx]:.2f}" for _, d in results],
                     "T @ 60 min (°C)": [f"{d['temperatures'][time_60_idx]:.2f}" for _, d in results],
-                    "T_final (°C)":    [f"{d['T_final']:.2f}"   for _, d    in results],
+                    "T_final (°C)":    [f"{d['T_final']:.2f}"  for _, d    in results],
                 }
                 st.dataframe(table, use_container_width=True)
+
+                st.info(
+                    "**Note:** With τ₁ = 3–5 min, the cabin reaches equilibrium by t = 15–20 min. "
+                    "RPM changes after t = 30 min have <0.1 °C effect on an already-stable temperature."
+                )
 
 
 if __name__ == "__main__":
