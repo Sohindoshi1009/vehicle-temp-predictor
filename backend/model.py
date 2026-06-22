@@ -406,19 +406,43 @@ def _fit_ode_calibration(df: pd.DataFrame):
         )
         scales[i] = np.clip(res.x, 0.01, 5.0)
 
+    mean_scales = scales.mean(axis=0)
+
     print("\nODE CALIBRATION SCALES (per vehicle):")
     for j, (_, row) in enumerate(df.iterrows()):
         print(f"  {row['vehicle']:<6s}: "
               f"q_in={scales[j,0]:.4f}  q_out={scales[j,1]:.4f}")
-    print(f"  Mean:  q_in={scales[:,0].mean():.4f}  q_out={scales[:,1].mean():.4f}")
+    print(f"  Mean:  q_in={mean_scales[0]:.4f}  q_out={mean_scales[1]:.4f}")
     print(f"  Range: q_in=[{scales[:,0].min():.4f},{scales[:,0].max():.4f}]  "
           f"q_out=[{scales[:,1].min():.4f},{scales[:,1].max():.4f}]")
+
+    # Print predicted vs actual for V1, V5, V9 using per-vehicle calibrated scales
+    show_times = [0, 5, 10, 30, 60, 90]
+    show_idxs  = [_IDX[t] for t in show_times]
+    vehicles_to_show = {"V1", "V5", "V9"}
+    veh_list = [(j, row) for j, (_, row) in enumerate(df.iterrows())
+                if row["vehicle"] in vehicles_to_show]
+    if veh_list:
+        print("\nODE PREDICTIONS vs ACTUAL (per-vehicle calibration):")
+        hdr = "        " + "".join(f"  t={t:2d}m" for t in show_times)
+        print(hdr)
+    for j, row in veh_list:
+        specs  = {c: row[c] for c in FEATURE_COLS}
+        actual = row[TEMP_COLS].values.astype(float)
+        T_0    = actual[0]
+        pred   = _solve_ode_curve(specs, scales[j, 0], scales[j, 1], T_0)
+        mae    = float(np.mean(np.abs(pred - actual)))
+        vname  = row["vehicle"]
+        act_s  = "".join(f"  {actual[i]:5.1f}" for i in show_idxs)
+        prd_s  = "".join(f"  {pred[i]:5.1f}" for i in show_idxs)
+        print(f"  {vname} actual:  {act_s}   MAE={mae:.2f}C")
+        print(f"  {vname} predict: {prd_s}")
 
     sc_ode    = StandardScaler()
     X_ode     = sc_ode.fit_transform(df[ODE_CALIB_FEATS].values)
     ridge_ode = Ridge(alpha=1.0)
     ridge_ode.fit(X_ode, scales)
-    return ridge_ode, sc_ode
+    return ridge_ode, sc_ode, mean_scales
 
 
 # ---------------------------------------------------------------------------
@@ -462,8 +486,21 @@ def predict_curve(specs_dict: dict, method: str = "physics_ridge"):
     if method == "ode_solver":
         X      = np.array([[eng[f] for f in ODE_CALIB_FEATS]])
         scales = _ridge_ode.predict(_sc_ode.transform(X))[0]
-        q_in_scale  = float(np.clip(scales[0], 0.0, 100.0))
-        q_out_scale = float(np.clip(scales[1], 0.0, 100.0))
+        q_in_scale  = float(np.clip(scales[0], 0.01, 5.0))
+        q_out_scale = float(np.clip(scales[1], 0.01, 5.0))
+
+        # Sanity check: verify net cooling at t=0 (rpm_0_30 segment).
+        # If Ridge predicts scales that cause net heating, fall back to mean training scales.
+        Q_in = (specs_dict["heat_load_kw"]
+                + specs_dict["ebhs"] * 0.003
+                + specs_dict["solar_w_m2"] * 0.001)
+        ac_power_0 = (specs_dict["compressor_size_cc"] * specs_dict["pulley_ratio"]
+                      * specs_dict["rpm_0_30"] / 1e6)
+        Q_out_0 = ac_power_0 + specs_dict["airflow_m3_hr"] * 1.2 * 1.006 * 10 / 3600
+        if q_out_scale * Q_out_0 <= q_in_scale * Q_in:
+            q_in_scale  = float(_mean_ode_scales[0])
+            q_out_scale = float(_mean_ode_scales[1])
+
         temps = _solve_ode_curve(specs_dict, q_in_scale, q_out_scale, _mean_T_soak).tolist()
         return temps, 0.0, 0.0, float(temps[-1])
 
@@ -683,7 +720,7 @@ def _validate_segments() -> None:
     print(f"  {n_pass}/{total} isolation checks passed\n")
 
 
-_ridge_ode, _sc_ode = _fit_ode_calibration(_df)
+_ridge_ode, _sc_ode, _mean_ode_scales = _fit_ode_calibration(_df)
 
 _validate_physics()
 _validate_segments()
