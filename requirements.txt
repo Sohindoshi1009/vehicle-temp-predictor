@@ -8,3 +8,5 @@ streamlit==1.35.0
 plotly==5.22.0
 pydantic==2.7.1
 python-multipart==0.0.9
+reportlab==4.2.2
+kaleido==0.2.1

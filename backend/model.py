@@ -3,7 +3,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.integrate import solve_ivp
 from scipy.optimize import curve_fit, minimize as _minimize
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
@@ -49,13 +48,17 @@ ENG_FEATS_ALL = [
 ]
 RF_FEATS = ENG_FEATS_ALL + ["time_min"]
 
-# Non-RPM features for ODE calibration — guarantees segment isolation
-ODE_CALIB_FEATS = [
-    "heat_density", "cooling_effectiveness", "airflow_heat_ratio", "solar_gain",
-    "net_cooling_power", "ebhs_heat_fraction", "heat_load_fraction", "ac_per_volume",
-    "net_cooling_per_volume", "heat_balance_ratio", "sealing_quality",
-    "infiltration_airflow_ratio", "thermal_mass", "tau_physics",
-]
+# ---------------------------------------------------------------------------
+# ODE 4-segment feature sets — STRICT ISOLATION per RPM band
+# ---------------------------------------------------------------------------
+ODE_SEG1_FEATS = ["ac_power_0_30",  "net_cooling_power", "thermal_mass",
+                   "airflow_m3_hr", "sealing_quality",    "cabin_volume_m3"]
+ODE_SEG2_FEATS = ["ac_power_31_50", "net_cooling_power", "thermal_mass", "airflow_m3_hr"]
+ODE_SEG3_FEATS = ["ac_power_51_70", "net_cooling_power", "thermal_mass", "airflow_m3_hr"]
+ODE_SEG4_FEATS = ["ac_power_71_90", "rpm_drop",          "net_cooling_power", "thermal_mass"]
+ODE_SEG_FEATS  = [ODE_SEG1_FEATS, ODE_SEG2_FEATS, ODE_SEG3_FEATS, ODE_SEG4_FEATS]
+SEG_BOUNDS     = [(0, 30), (30, 50), (50, 70), (70, 90)]
+SEG_RPM_KEYS   = ["rpm_0_30", "rpm_31_50", "rpm_51_70", "rpm_71_90"]
 
 _IDX = {t: i for i, t in enumerate(TIME_POINTS)}
 
@@ -351,98 +354,188 @@ def _reconstruct_segmented(tau_s1: float, tau_s2: float,
 
 
 # ---------------------------------------------------------------------------
-# ODE Solver: cabin heat balance + Ridge calibration
+# ODE Solver: 4-segment time-varying calibration
 # ---------------------------------------------------------------------------
 
-def _solve_ode_curve(specs: dict, q_in_scale: float, q_out_scale: float,
-                     T_init: float) -> np.ndarray:
-    """Integrate dT/dt = (Q_in_scale*Q_in − Q_out_scale*Q_out) / thermal_mass.
-    t_eval is in minutes → RHS multiplied by 60 to convert K/s → K/min.
+def _solve_ode_chained(specs: dict, scales_4: list, T_init: float) -> np.ndarray:
+    """4-segment analytical ODE. scales_4 = list of 4 (q_in, q_out) tuples.
+    Returns 19-element array at TIME_POINTS.
+
+    Since Q_in and Q_out are constant within each segment (no T-dependence),
+    the analytical solution is: T(t) = T_start + dT_dt * (t - t_start)
+    where dT_dt = (q_in*Q_in - q_out*Q_out) / thermal_mass * 60.
     """
     thermal_mass = specs["cabin_volume_m3"] * 1.2 * 1.006
-    Q_in = (specs["heat_load_kw"]
-            + specs["ebhs"]       * 0.003
-            + specs["solar_w_m2"] * 0.001)
-
-    def rhs(t, y):
-        if   t <= 30: rpm = specs["rpm_0_30"]
-        elif t <= 50: rpm = specs["rpm_31_50"]
-        elif t <= 70: rpm = specs["rpm_51_70"]
-        else:         rpm = specs["rpm_71_90"]
+    Q_in = specs["heat_load_kw"] + specs["ebhs"] * 0.003 + specs["solar_w_m2"] * 0.001
+    all_temps = []
+    T_cur = float(T_init)
+    for seg_idx, ((t_start, t_end), rpm_key) in enumerate(zip(SEG_BOUNDS, SEG_RPM_KEYS)):
+        q_in_s, q_out_s = scales_4[seg_idx]
+        rpm = specs[rpm_key]
         ac_power = specs["compressor_size_cc"] * specs["pulley_ratio"] * rpm / 1e6
         Q_out = ac_power + specs["airflow_m3_hr"] * 1.2 * 1.006 * 10 / 3600
-        return [(q_in_scale * Q_in - q_out_scale * Q_out) / thermal_mass * 60]
-
-    sol = solve_ivp(
-        rhs, (0.0, 90.0), [float(T_init)],
-        t_eval=np.array(TIME_POINTS, dtype=float),
-        method="RK45", max_step=0.5, rtol=1e-5, atol=1e-7,
-    )
-    return sol.y[0]
+        dT_dt = (q_in_s * Q_in - q_out_s * Q_out) / thermal_mass * 60
+        t_pts = [t for t in TIME_POINTS if t_start <= t <= t_end]
+        seg_temps = [T_cur + dT_dt * (t - t_start) for t in t_pts]
+        all_temps.extend(seg_temps if seg_idx == 0 else seg_temps[1:])
+        T_cur = float(seg_temps[-1])
+    return np.array(all_temps)
 
 
 def _fit_ode_calibration(df: pd.DataFrame):
-    """Per-vehicle linear least-squares to find (q_in_scale, q_out_scale);
-    then train Ridge on non-RPM features so new vehicles can be calibrated
-    without leaking RPM-band information across segments."""
-    scales = np.zeros((len(df), 2))
+    """Per-vehicle per-segment optimization to find (q_in_scale, q_out_scale)
+    for each of the 4 time bands; then train one Ridge model per segment on
+    segment-specific features so new vehicles can be calibrated without
+    leaking cross-band RPM information."""
+    n = len(df)
+    all_scales = np.zeros((n, 4, 2))  # [vehicle, segment, (q_in, q_out)]
 
     for i, (_, row) in enumerate(df.iterrows()):
         specs  = {c: row[c] for c in FEATURE_COLS}
         actual = row[TEMP_COLS].values.astype(float)
-        T_0    = actual[0]
+        thermal_mass = specs["cabin_volume_m3"] * 1.2 * 1.006
+        Q_in = specs["heat_load_kw"] + specs["ebhs"] * 0.003 + specs["solar_w_m2"] * 0.001
 
-        def _loss(params):
-            try:
-                pred = _solve_ode_curve(specs, params[0], params[1], T_0)
-                return float(np.sum((pred - actual) ** 2))
-            except Exception:
-                return 1e9
+        for seg_idx, ((t_start, t_end), rpm_key) in enumerate(zip(SEG_BOUNDS, SEG_RPM_KEYS)):
+            T_seg_start = float(actual[_IDX[t_start]])
+            t_eval_seg  = [t for t in TIME_POINTS if t_start <= t <= t_end]
+            actual_seg  = np.array([actual[_IDX[t]] for t in t_eval_seg])
+            rpm    = specs[rpm_key]
+            ac_pow = specs["compressor_size_cc"] * specs["pulley_ratio"] * rpm / 1e6
+            Q_out  = ac_pow + specs["airflow_m3_hr"] * 1.2 * 1.006 * 10 / 3600
 
-        res = _minimize(
-            _loss, x0=[0.12, 0.38], method="L-BFGS-B",
-            bounds=[(0.01, 5.0), (0.01, 5.0)],
-            options={"maxiter": 300, "ftol": 1e-12},
-        )
-        scales[i] = np.clip(res.x, 0.01, 5.0)
+            def _loss(params, T0=T_seg_start, ts=t_start, te=t_end,
+                      Qin=Q_in, Qout=Q_out, mass=thermal_mass,
+                      tpts=t_eval_seg, act=actual_seg):
+                dT = (params[0] * Qin - params[1] * Qout) / mass * 60
+                pred = np.array([T0 + dT * (t - ts) for t in tpts])
+                return float(np.sum((pred - act) ** 2))
 
-    mean_scales = scales.mean(axis=0)
+            res = _minimize(_loss, x0=[0.1, 0.4], method="L-BFGS-B",
+                            bounds=[(0.01, 5.0), (0.01, 5.0)],
+                            options={"maxiter": 300, "ftol": 1e-12})
+            all_scales[i, seg_idx] = np.clip(res.x, 0.01, 5.0)
 
-    print("\nODE CALIBRATION SCALES (per vehicle):")
-    for j, (_, row) in enumerate(df.iterrows()):
+    mean_scales = all_scales.mean(axis=0)  # shape (4, 2)
+    std_scales  = all_scales.std(axis=0, ddof=1)   # shape (4, 2)
+
+    # Print segment scales
+    print("\nODE SEGMENT CALIBRATION SCALES:")
+    for i, (_, row) in enumerate(df.iterrows()):
+        s = all_scales[i]
         print(f"  {row['vehicle']:<6s}: "
-              f"q_in={scales[j,0]:.4f}  q_out={scales[j,1]:.4f}")
-    print(f"  Mean:  q_in={mean_scales[0]:.4f}  q_out={mean_scales[1]:.4f}")
-    print(f"  Range: q_in=[{scales[:,0].min():.4f},{scales[:,0].max():.4f}]  "
-          f"q_out=[{scales[:,1].min():.4f},{scales[:,1].max():.4f}]")
+              f"s1=[{s[0,0]:.3f},{s[0,1]:.3f}]  "
+              f"s2=[{s[1,0]:.3f},{s[1,1]:.3f}]  "
+              f"s3=[{s[2,0]:.3f},{s[2,1]:.3f}]  "
+              f"s4=[{s[3,0]:.3f},{s[3,1]:.3f}]")
 
-    # Print predicted vs actual for V1, V5, V9 using per-vehicle calibrated scales
+    # Print V1, V5, V9 MAE
+    show_vehs  = {"V1", "V5", "V9"}
     show_times = [0, 5, 10, 30, 60, 90]
     show_idxs  = [_IDX[t] for t in show_times]
-    vehicles_to_show = {"V1", "V5", "V9"}
-    veh_list = [(j, row) for j, (_, row) in enumerate(df.iterrows())
-                if row["vehicle"] in vehicles_to_show]
-    if veh_list:
-        print("\nODE PREDICTIONS vs ACTUAL (per-vehicle calibration):")
-        hdr = "        " + "".join(f"  t={t:2d}m" for t in show_times)
-        print(hdr)
-    for j, row in veh_list:
+    all_maes   = []
+    rows_list  = [(i, row) for i, (_, row) in enumerate(df.iterrows())]
+    print("\nODE SEGMENT PREDICTIONS vs ACTUAL:")
+    print("        " + "".join(f"  t={t:2d}m" for t in show_times))
+    for i, row in rows_list:
         specs  = {c: row[c] for c in FEATURE_COLS}
         actual = row[TEMP_COLS].values.astype(float)
-        T_0    = actual[0]
-        pred   = _solve_ode_curve(specs, scales[j, 0], scales[j, 1], T_0)
+        sc4    = [(all_scales[i, s, 0], all_scales[i, s, 1]) for s in range(4)]
+        pred   = _solve_ode_chained(specs, sc4, actual[0])
         mae    = float(np.mean(np.abs(pred - actual)))
-        vname  = row["vehicle"]
-        act_s  = "".join(f"  {actual[i]:5.1f}" for i in show_idxs)
-        prd_s  = "".join(f"  {pred[i]:5.1f}" for i in show_idxs)
-        print(f"  {vname} actual:  {act_s}   MAE={mae:.2f}C")
-        print(f"  {vname} predict: {prd_s}")
+        all_maes.append(mae)
+        if row["vehicle"] in show_vehs:
+            act_s = "".join(f"  {actual[j]:5.1f}" for j in show_idxs)
+            prd_s = "".join(f"  {pred[j]:5.1f}" for j in show_idxs)
+            print(f"  {row['vehicle']} actual:  {act_s}   MAE={mae:.2f}C")
+            print(f"  {row['vehicle']} predict: {prd_s}")
+    ode_mae = float(np.mean(all_maes))
+    print(f"  Mean MAE across all {n}: {ode_mae:.2f}C")
 
-    sc_ode    = StandardScaler()
-    X_ode     = sc_ode.fit_transform(df[ODE_CALIB_FEATS].values)
-    ridge_ode = Ridge(alpha=1.0)
-    ridge_ode.fit(X_ode, scales)
-    return ridge_ode, sc_ode, mean_scales
+    # Train 4 Ridge models (one per segment) to predict scale pairs for new vehicles
+    ridge_models, sc_models = [], []
+    for seg_idx, feats in enumerate(ODE_SEG_FEATS):
+        sc  = StandardScaler()
+        X   = sc.fit_transform(df[feats].values)
+        rdg = Ridge(alpha=1.0)
+        rdg.fit(X, all_scales[:, seg_idx, :])
+        ridge_models.append(rdg)
+        sc_models.append(sc)
+
+    return ridge_models, sc_models, mean_scales, std_scales, ode_mae
+
+
+# ---------------------------------------------------------------------------
+# LOO CV uncertainty computation
+# ---------------------------------------------------------------------------
+
+def _loo_cv_uncertainty(df: pd.DataFrame) -> dict:
+    """Leave-one-out CV: compute per-timestep std dev of prediction residuals."""
+    n = len(df)
+    df_r = df.reset_index(drop=True)
+    res = {"physics_ridge": np.zeros((n, len(TIME_POINTS))),
+           "knn":           np.zeros((n, len(TIME_POINTS))),
+           "random_forest": np.zeros((n, len(TIME_POINTS)))}
+
+    for i in range(n):
+        train  = df_r.drop(i).reset_index(drop=True)
+        actual = df_r.iloc[i][TEMP_COLS].values.astype(float)
+        specs_i = {c: df_r.iloc[i][c] for c in FEATURE_COLS}
+        eng_i   = _engineer_single(specs_i)
+        mean_Tf = float(train["T_final"].mean())
+        mean_hb = float(train["heat_balance_ratio"].mean())
+        mean_Ts = float(train["T_soak"].mean())
+
+        # Physics Ridge
+        def _p(feats, tgt):
+            m, sc = _make_ridge(train, feats, tgt)
+            X = np.array([[eng_i[f] for f in feats]])
+            return float(m.predict(sc.transform(X))[0])
+
+        ts1 = max(0.5, _p(SEG1_FEATS, "tau_s1"))
+        ts2 = max(0.5, _p(SEG2_FEATS, "tau_s2"))
+        ts3 = max(0.5, _p(SEG3_FEATS, "tau_s3"))
+        ts4 = max(0.5, _p(SEG4_FEATS, "tau_s4"))
+        Tf  = max(5.0, mean_Tf * (eng_i["heat_balance_ratio"] / mean_hb))
+        res["physics_ridge"][i] = np.array(
+            _reconstruct_segmented(ts1, ts2, ts3, ts4, Tf, mean_Ts)
+        ) - actual
+
+        # KNN
+        sc_k = StandardScaler()
+        X_k  = sc_k.fit_transform(train[ENG_FEATS_ALL].values)
+        Y_k  = np.column_stack([train["tau_s1"], train["tau_s2"],
+                                 train["tau_s3"], train["tau_s4"], train["T_final"]])
+        kn = KNeighborsRegressor(n_neighbors=3)
+        kn.fit(X_k, Y_k)
+        pk = kn.predict(sc_k.transform(np.array([[eng_i[f] for f in ENG_FEATS_ALL]])))[0]
+        ts1k, ts2k, ts3k, ts4k = [max(0.5, float(pk[j])) for j in range(4)]
+        Tfk = max(5.0, float(pk[4]))
+        res["knn"][i] = np.array(
+            _reconstruct_segmented(ts1k, ts2k, ts3k, ts4k, Tfk, mean_Ts)
+        ) - actual
+
+        # Random Forest
+        X_rf, y_rf = _build_long_format(train)
+        rf_l = RandomForestRegressor(n_estimators=100, max_depth=4, random_state=42)
+        rf_l.fit(X_rf, y_rf)
+        base = [eng_i[f] for f in ENG_FEATS_ALL]
+        X_tst = np.array([[*base, float(t)] for t in TIME_POINTS])
+        res["random_forest"][i] = rf_l.predict(X_tst) - actual
+
+    print("\nLOO CV UNCERTAINTY (std dev per method):")
+    std = {m: np.std(v, axis=0, ddof=1) for m, v in res.items()}
+    for m, s in std.items():
+        print(f"  {m}: mean_std={s.mean():.2f}C  90%_band=+-{1.645 * s.mean():.2f}C")
+    return {m: s.tolist() for m, s in std.items()}
+
+
+# ---------------------------------------------------------------------------
+# Module-level: ODE calibration + LOO uncertainty (runs once at import time)
+# ---------------------------------------------------------------------------
+
+_ridge_ode_models, _sc_ode_models, _mean_ode_scales, _std_ode_scales, _ode_mae = _fit_ode_calibration(_df)
+_loo_uncertainty = _loo_cv_uncertainty(_df)
 
 
 # ---------------------------------------------------------------------------
@@ -450,10 +543,11 @@ def _fit_ode_calibration(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 
 def predict_curve(specs_dict: dict, method: str = "physics_ridge"):
-    """Return (temperatures, tau1, tau2, T_final).
+    """Return (temperatures, tau1, tau2, T_final, upper_band, lower_band).
 
     tau1 = segment-1 tau, tau2 = segment-4 tau (for display).
-    Both 0.0 for random_forest.
+    Both 0.0 for random_forest and ode_solver.
+    upper_band / lower_band are 90% confidence interval curves.
     """
     eng = _engineer_single(specs_dict)
 
@@ -469,7 +563,10 @@ def predict_curve(specs_dict: dict, method: str = "physics_ridge"):
         T_final = max(5.0, _mean_T_final * (eng["heat_balance_ratio"] / _mean_heat_balance))
 
         curve = _reconstruct_segmented(tau_s1, tau_s2, tau_s3, tau_s4, T_final, _mean_T_soak)
-        return curve, tau_s1, tau_s4, T_final
+        std_dev    = _loo_uncertainty["physics_ridge"]
+        upper_band = [t + 1.645 * s for t, s in zip(curve, std_dev)]
+        lower_band = [t - 1.645 * s for t, s in zip(curve, std_dev)]
+        return curve, tau_s1, tau_s4, T_final, upper_band, lower_band
 
     if method == "knn":
         X    = np.array([eng[f] for f in ENG_FEATS_ALL]).reshape(1, -1)
@@ -481,34 +578,49 @@ def predict_curve(specs_dict: dict, method: str = "physics_ridge"):
         T_final = max(5.0, float(pred[4]))
 
         curve = _reconstruct_segmented(tau_s1, tau_s2, tau_s3, tau_s4, T_final, _mean_T_soak)
-        return curve, tau_s1, tau_s4, T_final
+        std_dev    = _loo_uncertainty["knn"]
+        upper_band = [t + 1.645 * s for t, s in zip(curve, std_dev)]
+        lower_band = [t - 1.645 * s for t, s in zip(curve, std_dev)]
+        return curve, tau_s1, tau_s4, T_final, upper_band, lower_band
 
     if method == "ode_solver":
-        X      = np.array([[eng[f] for f in ODE_CALIB_FEATS]])
-        scales = _ridge_ode.predict(_sc_ode.transform(X))[0]
-        q_in_scale  = float(np.clip(scales[0], 0.01, 5.0))
-        q_out_scale = float(np.clip(scales[1], 0.01, 5.0))
-
-        # Sanity check: verify net cooling at t=0 (rpm_0_30 segment).
-        # If Ridge predicts scales that cause net heating, fall back to mean training scales.
-        Q_in = (specs_dict["heat_load_kw"]
-                + specs_dict["ebhs"] * 0.003
+        Q_in = (specs_dict["heat_load_kw"] + specs_dict["ebhs"] * 0.003
                 + specs_dict["solar_w_m2"] * 0.001)
-        ac_power_0 = (specs_dict["compressor_size_cc"] * specs_dict["pulley_ratio"]
-                      * specs_dict["rpm_0_30"] / 1e6)
-        Q_out_0 = ac_power_0 + specs_dict["airflow_m3_hr"] * 1.2 * 1.006 * 10 / 3600
-        if q_out_scale * Q_out_0 <= q_in_scale * Q_in:
-            q_in_scale  = float(_mean_ode_scales[0])
-            q_out_scale = float(_mean_ode_scales[1])
+        scales_4 = []
+        for seg_idx in range(4):
+            feats = ODE_SEG_FEATS[seg_idx]
+            X = np.array([[eng[f] for f in feats]])
+            s = _ridge_ode_models[seg_idx].predict(
+                _sc_ode_models[seg_idx].transform(X)
+            )[0]
+            q_in  = float(np.clip(s[0], 0.01, 5.0))
+            q_out = float(np.clip(s[1], 0.01, 5.0))
+            # Cooling check: fall back to mean segment scales if heating predicted
+            ac_pow = (specs_dict["compressor_size_cc"] * specs_dict["pulley_ratio"]
+                      * specs_dict[SEG_RPM_KEYS[seg_idx]] / 1e6)
+            Q_out_seg = ac_pow + specs_dict["airflow_m3_hr"] * 1.2 * 1.006 * 10 / 3600
+            if q_out * Q_out_seg <= q_in * Q_in:
+                q_in  = float(_mean_ode_scales[seg_idx, 0])
+                q_out = float(_mean_ode_scales[seg_idx, 1])
+            scales_4.append((q_in, q_out))
 
-        temps = _solve_ode_curve(specs_dict, q_in_scale, q_out_scale, _mean_T_soak).tolist()
-        return temps, 0.0, 0.0, float(temps[-1])
+        temps = _solve_ode_chained(specs_dict, scales_4, _mean_T_soak).tolist()
+        # Confidence band: ±1.645 × training MAE (same 90% convention as LOO methods).
+        # Scale-based bands are unbounded for linear ODEs without equilibrium,
+        # so MAE-based bands give more interpretable uncertainty.
+        half = 1.645 * _ode_mae
+        upper_band = [t + half for t in temps]
+        lower_band = [t - half for t in temps]
+        return temps, 0.0, 0.0, float(temps[-1]), upper_band, lower_band
 
     # random_forest: direct temperature prediction
     base_feats = [eng[f] for f in ENG_FEATS_ALL]
     X_rf  = np.array([[*base_feats, float(t)] for t in TIME_POINTS], dtype=float)
     temps = _rf.predict(X_rf).tolist()
-    return temps, 0.0, 0.0, float(min(temps))
+    std_dev    = _loo_uncertainty["random_forest"]
+    upper_band = [t + 1.645 * s for t, s in zip(temps, std_dev)]
+    lower_band = [t - 1.645 * s for t, s in zip(temps, std_dev)]
+    return temps, 0.0, 0.0, float(min(temps)), upper_band, lower_band
 
 
 def get_feature_importances() -> dict:
@@ -574,8 +686,8 @@ def _validate_ode_isolation() -> None:
     curves   = []
     for r in rpm_vals:
         s = dict(BASE); s["rpm_51_70"] = float(r)
-        c, _, _, _ = predict_curve(s, method="ode_solver")
-        curves.append(c)
+        result = predict_curve(s, method="ode_solver")
+        curves.append(result[0])
 
     print("\nODE SOLVER ISOLATION TEST (rpm_51_70 sweep 1400-2230):")
     TOL_CONST, TOL_VARY = 0.01, 0.05
@@ -623,7 +735,8 @@ def _validate_physics() -> None:
         s = dict(BASE); s.update(kw); return s
 
     def _run(specs):
-        _, tau1, _, T_final = predict_curve(specs, method="physics_ridge")
+        result = predict_curve(specs, method="physics_ridge")
+        tau1, T_final = result[1], result[3]
         return tau1, T_final
 
     checks = [
@@ -690,7 +803,7 @@ def _validate_segments() -> None:
         tag = "PASS" if passed else "FAIL"
         note = ""
         if not passed and not should_vary:
-            note = "  ← chain propagation from upstream segment"
+            note = "  <- chain propagation from upstream segment"
         print(f"  [{tag}] rpm_51_70 sweep — T@{tmin:2d}min must be {label:8s}: "
               f"spread={spread:.4f}°C{note}")
 
@@ -713,14 +826,12 @@ def _validate_segments() -> None:
         tag = "PASS" if passed else "FAIL"
         note = ""
         if not passed and not should_vary:
-            note = "  ← chain propagation from upstream segment"
+            note = "  <- chain propagation from upstream segment"
         print(f"  [{tag}] rpm_0_30  sweep — T@{tmin:2d}min must be {label:8s}: "
               f"spread={spread:.4f}°C{note}")
 
     print(f"  {n_pass}/{total} isolation checks passed\n")
 
-
-_ridge_ode, _sc_ode, _mean_ode_scales = _fit_ode_calibration(_df)
 
 _validate_physics()
 _validate_segments()

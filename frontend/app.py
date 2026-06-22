@@ -1,8 +1,12 @@
+import csv
+import io
 import os
+from datetime import datetime
 
 import numpy as np
 import plotly.colors as pc
 import plotly.graph_objects as go
+import plotly.io as pio
 import requests
 import streamlit as st
 
@@ -30,6 +34,13 @@ COLORS = {
     "knn":           "#2196F3",
     "random_forest": "#4CAF50",
     "ode_solver":    "#9C27B0",
+}
+
+BAND_COLORS = {
+    "physics_ridge": "rgba(230,57,70,0.15)",
+    "knn":           "rgba(33,150,243,0.15)",
+    "random_forest": "rgba(76,175,80,0.15)",
+    "ode_solver":    "rgba(156,39,176,0.15)",
 }
 
 METHOD_LABELS = {
@@ -140,6 +151,217 @@ def _top3_explanations(model_data: dict, model_type: str):
             st.markdown("")
 
 
+# ---------------------------------------------------------------------------
+# Export helpers
+# ---------------------------------------------------------------------------
+
+def _build_prediction_fig(predictions: dict, show_bands: bool) -> go.Figure:
+    """Rebuild the prediction chart (used for PDF export)."""
+    fig = go.Figure()
+    for method, data in predictions.items():
+        label = METHOD_LABELS[method]
+        color = COLORS[method]
+        band_color = BAND_COLORS[method]
+        upper = data.get("upper_band", [])
+        lower = data.get("lower_band", [])
+
+        if show_bands and upper and lower:
+            fig.add_trace(go.Scatter(
+                x=data["time_points"] + data["time_points"][::-1],
+                y=upper + lower[::-1],
+                fill="toself",
+                fillcolor=band_color,
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+
+        fig.add_trace(go.Scatter(
+            x=data["time_points"],
+            y=data["temperatures"],
+            mode="lines+markers",
+            name=f"Predicted ({label})",
+            line=dict(color=color, width=3),
+            marker=dict(size=7),
+            hovertemplate=f"<b>Predicted ({label})</b><br>t=%{{x}} min<br>T=%{{y:.2f}} °C<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title="Cabin Temperature vs Time",
+        xaxis_title="Time (minutes)",
+        yaxis_title="Temperature (°C)",
+        height=480,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=80),
+    )
+    if show_bands:
+        fig.add_annotation(
+            x=0.01, y=0.01, xref="paper", yref="paper",
+            text="Shaded regions = 90% confidence interval (leave-one-out CV)",
+            showarrow=False, font=dict(size=10, color="gray"),
+            xanchor="left",
+        )
+    return fig
+
+
+def _generate_csv(predictions: dict) -> str:
+    time_points = list(range(0, 95, 5))
+    fieldnames = ["time_min"]
+    for method in predictions:
+        label = method
+        fieldnames += [label, f"{label}_upper", f"{label}_lower"]
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for idx, t_min in enumerate(time_points):
+        row = {"time_min": t_min}
+        for method, data in predictions.items():
+            row[method]                = round(data["temperatures"][idx], 2)
+            row[f"{method}_upper"]     = round(data.get("upper_band", data["temperatures"])[idx], 2)
+            row[f"{method}_lower"]     = round(data.get("lower_band", data["temperatures"])[idx], 2)
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+def _generate_pdf(specs: dict, predictions: dict, show_bands: bool) -> bytes:
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (Image, Paragraph, SimpleDocTemplate,
+                                    Spacer, Table, TableStyle)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=2 * cm, leftMargin=2 * cm,
+        topMargin=2 * cm, bottomMargin=2 * cm,
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    # ── Page 1: Title + Input specs ──────────────────────────────────────────
+    story.append(Paragraph("Vehicle Cabin Temperature Prediction Report", styles["Title"]))
+    story.append(Spacer(1, 0.4 * cm))
+    story.append(Paragraph(
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        styles["Normal"],
+    ))
+    story.append(Spacer(1, 0.6 * cm))
+    story.append(Paragraph("Input Specifications", styles["Heading2"]))
+    story.append(Spacer(1, 0.2 * cm))
+
+    label_map = {k: v[0] for k, v in FEATURE_CONFIG.items()}
+    spec_data = [["Feature", "Value"]] + [
+        [label_map.get(k, k), f"{v:.3g}"] for k, v in specs.items()
+    ]
+    spec_tbl = Table(spec_data, colWidths=[11 * cm, 5 * cm])
+    spec_tbl.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0),  rl_colors.HexColor("#E63946")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0),  rl_colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("GRID",        (0, 0), (-1, -1), 0.4, rl_colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [rl_colors.white, rl_colors.HexColor("#F5F5F5")]),
+        ("FONTSIZE",    (0, 0), (-1, -1), 9),
+        ("TOPPADDING",  (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(spec_tbl)
+
+    # ── Page 2: Predictions table ─────────────────────────────────────────────
+    story.append(Spacer(1, 0.8 * cm))
+    story.append(Paragraph("Temperature Predictions", styles["Heading2"]))
+    story.append(Spacer(1, 0.2 * cm))
+
+    methods = list(predictions.keys())
+    header = ["Time (min)"] + [METHOD_LABELS[m] for m in methods]
+    pred_rows = [header]
+    for idx, t_min in enumerate(range(0, 95, 5)):
+        pred_rows.append(
+            [str(t_min)] + [f"{predictions[m]['temperatures'][idx]:.1f}" for m in methods]
+        )
+    col_w = [3 * cm] + [max(3, 16 // max(len(methods), 1)) * cm] * len(methods)
+    pred_tbl = Table(pred_rows, colWidths=col_w)
+    pred_tbl.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0),  rl_colors.HexColor("#2196F3")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0),  rl_colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("GRID",        (0, 0), (-1, -1), 0.4, rl_colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [rl_colors.white, rl_colors.HexColor("#F5F5F5")]),
+        ("FONTSIZE",    (0, 0), (-1, -1), 9),
+        ("TOPPADDING",  (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
+    ]))
+    story.append(pred_tbl)
+
+    # ── Page 3: Chart image ───────────────────────────────────────────────────
+    story.append(Spacer(1, 0.8 * cm))
+    story.append(Paragraph("Temperature Curves", styles["Heading2"]))
+    story.append(Spacer(1, 0.2 * cm))
+    try:
+        fig = _build_prediction_fig(predictions, show_bands)
+        img_bytes = pio.to_image(fig, format="png", width=800, height=480, scale=1.5)
+        img_buf = io.BytesIO(img_bytes)
+        story.append(Image(img_buf, width=16 * cm, height=9.6 * cm))
+        if show_bands:
+            story.append(Paragraph(
+                "Shaded regions represent 90% confidence intervals based on "
+                "leave-one-out cross-validation across all 14 training vehicles.",
+                styles["Italic"],
+            ))
+    except Exception as exc:
+        story.append(Paragraph(f"[Chart unavailable: {exc}]", styles["Normal"]))
+
+    # ── Page 4: Model notes ───────────────────────────────────────────────────
+    story.append(Spacer(1, 0.8 * cm))
+    story.append(Paragraph("Method Notes", styles["Heading2"]))
+    notes = [
+        ("Physics + Ridge",
+         "Four-segment Newton's Law of Cooling with per-segment Ridge regression "
+         "predicting time constants (τ). Fast cooling in segment 1 (0–30 min) "
+         "dominates; T_final scaled by heat-balance ratio."),
+        ("KNN (k=3)",
+         "K-Nearest Neighbors on 21 engineered features predicts all four segment "
+         "time constants and T_final simultaneously. Interpolates from the 3 most "
+         "similar training vehicles."),
+        ("Random Forest",
+         "Ensemble of 100 decision trees predicts cabin temperature directly using "
+         "vehicle features + elapsed time as inputs. Captures non-linear interactions."),
+        ("ODE Solver",
+         "Numerical heat-balance ODE: dT/dt = (Q_in − Q_out) / thermal_mass. "
+         "Four segment-specific (q_in, q_out) scale pairs are calibrated per vehicle "
+         "then predicted for new vehicles via segment-specific Ridge models. Slope "
+         "changes at RPM transitions (t=30, 50, 70 min) are visible in the curve."),
+    ]
+    for name, desc in notes:
+        story.append(Paragraph(f"<b>{name}:</b> {desc}", styles["Normal"]))
+        story.append(Spacer(1, 0.3 * cm))
+
+    story.append(Spacer(1, 0.4 * cm))
+    story.append(Paragraph("Known Limitations", styles["Heading2"]))
+    lims = [
+        "Training set: 14 vehicles only. KNN and RF may extrapolate poorly outside the training range.",
+        "ODE solver uses air-only thermal mass; real cabin mass (seats, panels) is ~10× larger.",
+        "Confidence bands are based on LOO CV over 14 vehicles and may underestimate true uncertainty.",
+        "EBHS (Equivalent Body Hole Size) is an internal calibration parameter not directly measurable.",
+    ]
+    for lim in lims:
+        story.append(Paragraph(f"• {lim}", styles["Normal"]))
+        story.append(Spacer(1, 0.15 * cm))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
+
 def main():
     st.set_page_config(
         page_title="Vehicle Cabin Temp Predictor",
@@ -191,6 +413,9 @@ def main():
                 else:
                     st.session_state.predictions[method] = data
 
+        # Confidence band toggle
+        show_bands = st.checkbox("Show 90% confidence bands", value=True)
+
         fig = go.Figure()
 
         if show_training:
@@ -206,13 +431,41 @@ def main():
                 ))
 
         for method, data in st.session_state.predictions.items():
-            label = METHOD_LABELS[method]
+            label      = METHOD_LABELS[method]
+            color      = COLORS[method]
+            band_color = BAND_COLORS[method]
+            upper      = data.get("upper_band", [])
+            lower      = data.get("lower_band", [])
+
+            if show_bands and upper and lower:
+                # Upper invisible line + fill down to lower
+                fig.add_trace(go.Scatter(
+                    x=data["time_points"],
+                    y=upper,
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                    name=f"upper_{method}",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=data["time_points"],
+                    y=lower,
+                    mode="lines",
+                    fill="tonexty",
+                    fillcolor=band_color,
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                    name=f"lower_{method}",
+                ))
+
             fig.add_trace(go.Scatter(
                 x=data["time_points"],
                 y=data["temperatures"],
                 mode="lines+markers",
                 name=f"Predicted ({label})",
-                line=dict(color=COLORS[method], width=3),
+                line=dict(color=color, width=3),
                 marker=dict(size=7),
                 hovertemplate=f"<b>Predicted ({label})</b><br>t=%{{x}} min<br>T=%{{y:.2f}} °C<extra></extra>",
             ))
@@ -226,6 +479,12 @@ def main():
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             margin=dict(t=80),
         )
+        if show_bands and st.session_state.predictions:
+            fig.add_annotation(
+                x=0.01, y=0.01, xref="paper", yref="paper",
+                text="Shaded regions = 90% confidence interval (leave-one-out CV)",
+                showarrow=False, font=dict(size=10, color="gray"), xanchor="left",
+            )
         st.plotly_chart(fig, use_container_width=True)
 
         if st.session_state.predictions:
@@ -239,6 +498,39 @@ def main():
                 cols[idx + 1].metric(f"τ₂ — {label} (min)",    "N/A" if no_tau else f"{data['tau2']:.2f}")
                 cols[idx + 2].metric(f"T_final — {label} (°C)", f"{data['T_final']:.2f}")
                 idx += 3
+
+            # ── Export section ─────────────────────────────────────────────────
+            st.divider()
+            st.subheader("Export Results")
+            exp_col1, exp_col2 = st.columns(2)
+
+            with exp_col1:
+                csv_data = _generate_csv(st.session_state.predictions)
+                st.download_button(
+                    label="Download Predictions (CSV)",
+                    data=csv_data,
+                    file_name="vehicle_temp_prediction.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            with exp_col2:
+                try:
+                    pdf_bytes = _generate_pdf(specs, st.session_state.predictions, show_bands)
+                    st.download_button(
+                        label="Download PDF Report",
+                        data=pdf_bytes,
+                        file_name="vehicle_temp_report.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                except Exception as pdf_err:
+                    st.button(
+                        "Download PDF Report",
+                        disabled=True,
+                        use_container_width=True,
+                        help=f"PDF generation failed: {pdf_err}",
+                    )
 
     # ── Tab 2: Feature Importance ──────────────────────────────────────────────
     with tab2:
@@ -436,10 +728,10 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
 
                 st.subheader("Parameter Summary")
-                time_5_idx  = 1   # TIME_POINTS[1]  ==  5 min
-                time_15_idx = 3   # TIME_POINTS[3]  == 15 min
-                time_30_idx = 6   # TIME_POINTS[6]  == 30 min
-                time_60_idx = 12  # TIME_POINTS[12] == 60 min
+                time_5_idx  = 1
+                time_15_idx = 3
+                time_30_idx = 6
+                time_60_idx = 12
                 table = {
                     label_full:        [f"{v:.2f}"             for v, _    in results],
                     "τ₁ (min)":        [f"{d['tau1']:.2f}"     for _, d    in results],

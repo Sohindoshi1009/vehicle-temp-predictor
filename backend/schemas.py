@@ -27,3 +27,6 @@ class PredictionResponse(BaseModel):
     tau2: float
     T_final: float
     method: str
+    upper_band: List[float]
+    lower_band: List[float]
+    confidence_level: float = 0.90
