@@ -3,7 +3,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import curve_fit
+from scipy.integrate import solve_ivp
+from scipy.optimize import curve_fit, minimize as _minimize
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.neighbors import KNeighborsRegressor
@@ -47,6 +48,14 @@ ENG_FEATS_ALL = [
     "ac_power_0_30", "ac_power_31_50", "ac_power_51_70", "ac_power_71_90",
 ]
 RF_FEATS = ENG_FEATS_ALL + ["time_min"]
+
+# Non-RPM features for ODE calibration — guarantees segment isolation
+ODE_CALIB_FEATS = [
+    "heat_density", "cooling_effectiveness", "airflow_heat_ratio", "solar_gain",
+    "net_cooling_power", "ebhs_heat_fraction", "heat_load_fraction", "ac_per_volume",
+    "net_cooling_per_volume", "heat_balance_ratio", "sealing_quality",
+    "infiltration_airflow_ratio", "thermal_mass", "tau_physics",
+]
 
 _IDX = {t: i for i, t in enumerate(TIME_POINTS)}
 
@@ -342,6 +351,77 @@ def _reconstruct_segmented(tau_s1: float, tau_s2: float,
 
 
 # ---------------------------------------------------------------------------
+# ODE Solver: cabin heat balance + Ridge calibration
+# ---------------------------------------------------------------------------
+
+def _solve_ode_curve(specs: dict, q_in_scale: float, q_out_scale: float,
+                     T_init: float) -> np.ndarray:
+    """Integrate dT/dt = (Q_in_scale*Q_in − Q_out_scale*Q_out) / thermal_mass.
+    t_eval is in minutes → RHS multiplied by 60 to convert K/s → K/min.
+    """
+    thermal_mass = specs["cabin_volume_m3"] * 1.2 * 1.006
+    Q_in = (specs["heat_load_kw"]
+            + specs["ebhs"]       * 0.003
+            + specs["solar_w_m2"] * 0.001)
+
+    def rhs(t, y):
+        if   t <= 30: rpm = specs["rpm_0_30"]
+        elif t <= 50: rpm = specs["rpm_31_50"]
+        elif t <= 70: rpm = specs["rpm_51_70"]
+        else:         rpm = specs["rpm_71_90"]
+        ac_power = specs["compressor_size_cc"] * specs["pulley_ratio"] * rpm / 1e6
+        Q_out = ac_power + specs["airflow_m3_hr"] * 1.2 * 1.006 * 10 / 3600
+        return [(q_in_scale * Q_in - q_out_scale * Q_out) / thermal_mass * 60]
+
+    sol = solve_ivp(
+        rhs, (0.0, 90.0), [float(T_init)],
+        t_eval=np.array(TIME_POINTS, dtype=float),
+        method="RK45", max_step=0.5, rtol=1e-5, atol=1e-7,
+    )
+    return sol.y[0]
+
+
+def _fit_ode_calibration(df: pd.DataFrame):
+    """Per-vehicle linear least-squares to find (q_in_scale, q_out_scale);
+    then train Ridge on non-RPM features so new vehicles can be calibrated
+    without leaking RPM-band information across segments."""
+    scales = np.zeros((len(df), 2))
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        specs  = {c: row[c] for c in FEATURE_COLS}
+        actual = row[TEMP_COLS].values.astype(float)
+        T_0    = actual[0]
+
+        def _loss(params):
+            try:
+                pred = _solve_ode_curve(specs, params[0], params[1], T_0)
+                return float(np.sum((pred - actual) ** 2))
+            except Exception:
+                return 1e9
+
+        res = _minimize(
+            _loss, x0=[0.12, 0.38], method="L-BFGS-B",
+            bounds=[(0.01, 5.0), (0.01, 5.0)],
+            options={"maxiter": 300, "ftol": 1e-12},
+        )
+        scales[i] = np.clip(res.x, 0.01, 5.0)
+
+    print("\nODE CALIBRATION SCALES (per vehicle):")
+    for j, (_, row) in enumerate(df.iterrows()):
+        print(f"  {row['vehicle']:<6s}: "
+              f"q_in={scales[j,0]:.4f}  q_out={scales[j,1]:.4f}")
+    print(f"  Mean:  q_in={scales[:,0].mean():.4f}  q_out={scales[:,1].mean():.4f}")
+    print(f"  Range: q_in=[{scales[:,0].min():.4f},{scales[:,0].max():.4f}]  "
+          f"q_out=[{scales[:,1].min():.4f},{scales[:,1].max():.4f}]")
+
+    sc_ode    = StandardScaler()
+    X_ode     = sc_ode.fit_transform(df[ODE_CALIB_FEATS].values)
+    ridge_ode = Ridge(alpha=1.0)
+    ridge_ode.fit(X_ode, scales)
+    return ridge_ode, sc_ode
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -378,6 +458,14 @@ def predict_curve(specs_dict: dict, method: str = "physics_ridge"):
 
         curve = _reconstruct_segmented(tau_s1, tau_s2, tau_s3, tau_s4, T_final, _mean_T_soak)
         return curve, tau_s1, tau_s4, T_final
+
+    if method == "ode_solver":
+        X      = np.array([[eng[f] for f in ODE_CALIB_FEATS]])
+        scales = _ridge_ode.predict(_sc_ode.transform(X))[0]
+        q_in_scale  = float(np.clip(scales[0], 0.0, 100.0))
+        q_out_scale = float(np.clip(scales[1], 0.0, 100.0))
+        temps = _solve_ode_curve(specs_dict, q_in_scale, q_out_scale, _mean_T_soak).tolist()
+        return temps, 0.0, 0.0, float(temps[-1])
 
     # random_forest: direct temperature prediction
     base_feats = [eng[f] for f in ENG_FEATS_ALL]
@@ -430,6 +518,55 @@ def get_all_vehicle_curves() -> list:
             "T_final":      round(row["T_final"], 3),
         })
     return result
+
+
+# ---------------------------------------------------------------------------
+# Validation: ODE segment isolation
+# ---------------------------------------------------------------------------
+
+def _validate_ode_isolation() -> None:
+    """Verify rpm_51_70 only affects temperatures in its own window (50–70 min)."""
+    BASE = {
+        "heat_load_kw": 4.8, "cabin_volume_m3": 3.1, "pulley_ratio": 1.5,
+        "solar_w_m2": 1200.0, "ac_unit_capacity_kw": 4.4, "condenser_capacity_kw": 9.0,
+        "compressor_size_cc": 130.0, "airflow_m3_hr": 550.0, "soaking_time_hr": 1.0,
+        "rpm_0_30": 1600.0, "rpm_31_50": 1700.0, "rpm_51_70": 1800.0,
+        "rpm_71_90": 750.0, "ebhs": 100.0,
+    }
+    rpm_vals = np.linspace(1400, 2230, 5)
+    curves   = []
+    for r in rpm_vals:
+        s = dict(BASE); s["rpm_51_70"] = float(r)
+        c, _, _, _ = predict_curve(s, method="ode_solver")
+        curves.append(c)
+
+    print("\nODE SOLVER ISOLATION TEST (rpm_51_70 sweep 1400-2230):")
+    TOL_CONST, TOL_VARY = 0.01, 0.05
+    checks = [
+        (5,  True,  "constant"),
+        (15, True,  "constant"),
+        (30, True,  "constant"),
+        (55, False, "varies"),
+        (65, False, "varies"),
+    ]
+    n_pass = 0
+    for t_min, should_be_const, label in checks:
+        vals   = [c[_IDX[t_min]] for c in curves]
+        spread = max(vals) - min(vals)
+        passed = (spread < TOL_CONST) if should_be_const else (spread > TOL_VARY)
+        n_pass += passed
+        print(f"  [{'PASS' if passed else 'FAIL'}] T@{t_min:2d}min must be {label:8s}: "
+              f"spread={spread:.4f}°C  [{', '.join(f'{v:.3f}' for v in vals)}]")
+
+    c_mid    = curves[2]
+    s_before = (c_mid[_IDX[50]] - c_mid[_IDX[45]]) / 5
+    s_after  = (c_mid[_IDX[55]] - c_mid[_IDX[50]]) / 5
+    change   = abs(s_after - s_before)
+    print(f"\n  Slope before t=50 (45-50 min): {s_before:+.4f} K/min")
+    print(f"  Slope after  t=50 (50-55 min): {s_after:+.4f} K/min")
+    print(f"  Slope change at t=50:           {change:.4f} K/min "
+          f"({'visible' if change > 0.01 else 'imperceptible'})")
+    print(f"  {n_pass}/{len(checks)} ODE isolation checks passed\n")
 
 
 # ---------------------------------------------------------------------------
@@ -546,5 +683,8 @@ def _validate_segments() -> None:
     print(f"  {n_pass}/{total} isolation checks passed\n")
 
 
+_ridge_ode, _sc_ode = _fit_ode_calibration(_df)
+
 _validate_physics()
 _validate_segments()
+_validate_ode_isolation()

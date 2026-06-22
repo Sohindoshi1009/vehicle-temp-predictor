@@ -29,12 +29,14 @@ COLORS = {
     "physics_ridge": "#E63946",
     "knn":           "#2196F3",
     "random_forest": "#4CAF50",
+    "ode_solver":    "#9C27B0",
 }
 
 METHOD_LABELS = {
     "physics_ridge": "Physics + Ridge",
     "knn":           "KNN",
     "random_forest": "Random Forest",
+    "ode_solver":    "ODE Solver",
 }
 
 FEATURE_EXPLANATIONS = {
@@ -163,10 +165,11 @@ def main():
 
     # ── Tab 1: Prediction ──────────────────────────────────────────────────────
     with tab1:
-        col_r, col_k, col_rf, col_clr = st.columns([2, 2, 2, 1])
+        col_r, col_k, col_rf, col_ode, col_clr = st.columns([2, 2, 2, 2, 1])
         clicked_ridge = col_r.button("Predict (Physics + Ridge)", use_container_width=True)
         clicked_knn   = col_k.button("Predict (KNN)",             use_container_width=True)
         clicked_rf    = col_rf.button("Predict (Random Forest)",  use_container_width=True)
+        clicked_ode   = col_ode.button("Predict (ODE Solver)",    use_container_width=True)
         clicked_clear = col_clr.button("Clear",                   use_container_width=True)
 
         if "predictions" not in st.session_state:
@@ -179,6 +182,7 @@ def main():
             (clicked_ridge, "physics_ridge"),
             (clicked_knn,   "knn"),
             (clicked_rf,    "random_forest"),
+            (clicked_ode,   "ode_solver"),
         ]:
             if btn:
                 data, err = call_predict(specs, method)
@@ -230,9 +234,9 @@ def main():
             idx = 0
             for method, data in st.session_state.predictions.items():
                 label = METHOD_LABELS[method]
-                is_rf = method == "random_forest"
-                cols[idx    ].metric(f"τ₁ — {label} (min)",    "N/A" if is_rf else f"{data['tau1']:.2f}")
-                cols[idx + 1].metric(f"τ₂ — {label} (min)",    "N/A" if is_rf else f"{data['tau2']:.2f}")
+                no_tau = method in ("random_forest", "ode_solver")
+                cols[idx    ].metric(f"τ₁ — {label} (min)",    "N/A" if no_tau else f"{data['tau1']:.2f}")
+                cols[idx + 1].metric(f"τ₂ — {label} (min)",    "N/A" if no_tau else f"{data['tau2']:.2f}")
                 cols[idx + 2].metric(f"T_final — {label} (°C)", f"{data['T_final']:.2f}")
                 idx += 3
 
@@ -290,11 +294,19 @@ def main():
             feat_keys   = list(FEATURE_CONFIG.keys())
             feat_labels = {k: FEATURE_CONFIG[k][0] for k in feat_keys}
 
-            sens_mode = st.radio(
-                "Analysis mode",
-                options=["Individual band", "All bands scaled"],
-                horizontal=True,
-            )
+            c_mode, c_meth = st.columns([3, 2])
+            with c_mode:
+                sens_mode = st.radio(
+                    "Analysis mode",
+                    options=["Individual band", "All bands scaled"],
+                    horizontal=True,
+                )
+            with c_meth:
+                sens_method = st.selectbox(
+                    "Prediction method",
+                    options=["physics_ridge", "knn", "random_forest", "ode_solver"],
+                    format_func=lambda m: METHOD_LABELS[m],
+                )
 
             selected_feat = None
             feat_min = feat_max = None
@@ -345,7 +357,7 @@ def main():
                         for v in test_vals:
                             test_specs = dict(specs)
                             test_specs[selected_feat] = float(v)
-                            data, err = call_predict(test_specs, "physics_ridge")
+                            data, err = call_predict(test_specs, sens_method)
                             if data:
                                 results.append((float(v), data))
                     st.session_state.sensitivity = {
@@ -363,7 +375,7 @@ def main():
                             test_specs["rpm_31_50"] = float(specs["rpm_31_50"] * mult)
                             test_specs["rpm_51_70"] = float(specs["rpm_51_70"] * mult)
                             test_specs["rpm_71_90"] = float(specs["rpm_71_90"] * mult)
-                            data, err = call_predict(test_specs, "physics_ridge")
+                            data, err = call_predict(test_specs, sens_method)
                             if data:
                                 results.append((float(mult), data))
                     st.session_state.sensitivity = {
