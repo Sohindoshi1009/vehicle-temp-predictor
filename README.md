@@ -20,7 +20,9 @@ This app predicts the **cabin cool-down curve** for any vehicle over a 90-minute
 
 ### Screenshot
 
-> [Add screenshot here]
+![App Screenshot](docs/screenshot.png)
+
+> **Note:** Run the app and take a screenshot of the Prediction tab (showing all 3 model curves), then save it as `docs/screenshot.png`.
 
 ### Run Locally
 
@@ -193,6 +195,19 @@ All 13 primary engineered features, their formulas, physical meaning, and which 
 
 ---
 
+## Model Comparison
+
+| Aspect | Physics + Ridge | KNN | Random Forest |
+|---|---|---|---|
+| Training samples needed | 14 | 14 | 266 (augmented) |
+| Extrapolation ability | Good | Poor | Moderate |
+| Interpretability | High | Medium | Low |
+| Physics consistency | Enforced | Not enforced | Not enforced |
+| Best for | New designs | Similar vehicles | Pattern discovery |
+| Overfitting risk | Low (Ridge) | Low | Moderate |
+
+---
+
 ## Physics Validation
 
 Four directional tests verify that the Ridge model respects physical intuition:
@@ -203,6 +218,20 @@ Four directional tests verify that the Ridge model respects physical intuition:
 | Higher airflow → smaller τ_s1 | airflow=449 m³/hr | airflow=641 m³/hr | τ_s1 ↓ | ✅ PASS |
 | Higher heat_load → higher T_final | heat=3.6 kW | heat=5.5 kW | T_final ↑ | ✅ PASS |
 | Higher AC capacity → lower T_final | ac=4.4 kW | ac=5.4 kW | T_final ↓ | ✅ PASS |
+
+---
+
+## Future Work
+
+1. **More training vehicles** — particularly vehicles with slow cool-down (τ > 10 min) to make segments 2–4 learnable
+
+2. **Ambient temperature as input** — current model assumes fixed ambient; real predictions need ambient temp as a feature
+
+3. **Neural network** — with 50+ vehicles, a small feedforward network (2 layers, 16 neurons) could capture segment interactions automatically
+
+4. **Real-time prediction** — integrate with vehicle CAN bus data to predict remaining cool-down time during an actual test
+
+5. **Uncertainty quantification** — add Gaussian Process or conformal prediction intervals so engineers know prediction confidence bounds
 
 ---
 
@@ -228,7 +257,7 @@ Four directional tests verify that the Ridge model respects physical intuition:
 ### Setup
 
 ```bash
-git clone [repo url]
+git clone git@github.com:Sohindoshi1009/vehicle-temp-predictor.git
 cd vehicle-temp-predictor
 python -m venv venv
 venv\Scripts\activate        # Windows
@@ -277,4 +306,4 @@ streamlit run frontend/app.py
 **Ishwari Shah** — Mobile Tech Lead
 
 Built as part of an AI/ML certification roadmap:
-**Azure AI-102 → AWS AIF-C01 → PMI-CPMAI**
+**Azure AI-103 → AWS AIF-C01 → PMI-CPMAI**
